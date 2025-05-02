@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"bytes"
@@ -32,9 +33,24 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		log.Fatal(err)
 	}
 
+	// "Sanitize" request for use as key by removing headers that will change w/ each request
+	reqReader := bufio.NewReader(strings.NewReader(b.String()))
+	parsedRequest, err := http.ReadRequest(reqReader)
+	if err != nil {
+		log.Panic(err)
+	}
+	parsedRequest.Header.Del("X-Amz-Date")
+	parsedRequest.Header.Del("X-Amz-Content-Sha256") // This one could probably just be left
+	parsedRequest.Header.Del("Authorization")
+
+	dump, err := httputil.DumpRequest(parsedRequest, true)
+	if err != nil {
+		panic(err)
+	}
+
 	// Hit the cache
 	var data []byte
-	if err := group.Get(r.Context(), b.String(), groupcache.AllocatingByteSliceSink(&data)); err != nil {
+	if err := group.Get(context.WithValue(r.Context(), "orig_request", b.String()), string(dump), groupcache.AllocatingByteSliceSink(&data)); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -51,7 +67,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(res.StatusCode)
 	io.Copy(w, res.Body)
 	res.Body.Close()
-}	
+}
 
 func newPool(peers []string) *groupcache.HTTPPool {
 	pool := groupcache.NewHTTPPoolOpts(peers[0], nil)
@@ -64,25 +80,30 @@ var group *groupcache.Group
 
 func newGroup(hostName string, cacheSizeBytes int64) {
 	group = groupcache.NewGroup("requests", cacheSizeBytes, groupcache.GetterFunc(
-		func(_ context.Context, key string, sink groupcache.Sink) error {
+		func(ctx context.Context, key string, sink groupcache.Sink) error {
 			me, err := os.Hostname()
 			if err != nil {
 				log.Panic(err)
 			}
-	
+
 			log.Printf("Request handled by %s", me)
-	
-			// Rebuild HTTP request from cache key
-			reader := bufio.NewReader(strings.NewReader(key))
+
+			// Rebuild HTTP request from orig_request context
+			origRequestString, ok := ctx.Value("orig_request").(string)
+			if !ok {
+				log.Panic("Can't get original request from context")
+			}
+			log.Println(origRequestString)
+			reader := bufio.NewReader(strings.NewReader(origRequestString))
 			originalRequest, err := http.ReadRequest(reader)
 			if err != nil {
 				log.Panic(err)
 			}
-	
+
 			// We can't have this set on client requests
 			originalRequest.RequestURI = ""
-	
-			rawURL := "http://" + hostName
+
+			rawURL := "https://" + hostName
 			if originalRequest.URL.Path != "" {
 				rawURL = rawURL + originalRequest.URL.Path
 			}
@@ -92,13 +113,13 @@ func newGroup(hostName string, cacheSizeBytes int64) {
 			}
 			originalRequest.URL = fullUrl
 			originalRequest.Host = hostName
-	
+
 			client := http.Client{}
 			res, err := client.Do(originalRequest)
 			if err != nil {
 				log.Panic(err)
 			}
-	
+
 			// Write HTTP response out to bytes, store in cache
 			var outBuf bytes.Buffer
 			if err := res.Write(&outBuf); err != nil {
@@ -107,7 +128,7 @@ func newGroup(hostName string, cacheSizeBytes int64) {
 			sink.SetBytes(outBuf.Bytes(), time.Time{})
 			return nil
 		},
-	))	
+	))
 }
 
 
@@ -128,12 +149,9 @@ func main() {
 		log.Fatal("Missing required env variable GROUPCACHE_PEERS")
 	}
 
-
-
 	// Setup groupcache
 	newGroup(proxyHostname, cacheSizeBytes)
 	peersList := strings.Split(cachePeers, ",")
-	
 
 	log.Printf("listening on %v", peersList[0])
 	log.Printf("peers: %v", peersList)
